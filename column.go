@@ -727,7 +727,12 @@ func (c *Column) decompress(compressedPageData []byte, uncompressedPageSize int3
 // DecodeDataPageV1 decodes a data page from the header, compressed data, and
 // optional dictionary passed as arguments.
 func (c *Column) DecodeDataPageV1(header DataPageHeaderV1, page []byte, dict Dictionary) (Page, error) {
-	return c.decodeDataPageV1(header, newBuffer(page), dict, -1)
+	if c.useWindowedDictionary(header) {
+		page = append([]byte(nil), page...)
+	}
+	buffer := newBuffer(page)
+	defer buffer.unref()
+	return c.decodeDataPageV1(header, buffer, dict, -1)
 }
 
 func (c *Column) decodeDataPageV1(header DataPageHeaderV1, page *buffer[byte], dict Dictionary, size int32) (Page, error) {
@@ -778,7 +783,12 @@ func (c *Column) decodeDataPageV1(header DataPageHeaderV1, page *buffer[byte], d
 // DecodeDataPageV2 decodes a data page from the header, compressed data, and
 // optional dictionary passed as arguments.
 func (c *Column) DecodeDataPageV2(header DataPageHeaderV2, page []byte, dict Dictionary) (Page, error) {
-	return c.decodeDataPageV2(header, newBuffer(page), dict, -1)
+	if c.useWindowedDictionary(header) {
+		page = append([]byte(nil), page...)
+	}
+	buffer := newBuffer(page)
+	defer buffer.unref()
+	return c.decodeDataPageV2(header, buffer, dict, -1)
 }
 
 func (c *Column) decodeDataPageV2(header DataPageHeaderV2, page *buffer[byte], dict Dictionary, size int32) (Page, error) {
@@ -842,6 +852,13 @@ func (c *Column) decodeDataPageV2(header DataPageHeaderV2, page *buffer[byte], d
 	return c.decodeDataPage(header, numValues, repetitionLevels, definitionLevels, page, pageData, dict)
 }
 
+// Exported decoders copy eligible encoded input; FilePages supplies owned buffers.
+func (c *Column) useWindowedDictionary(header DataPageHeader) bool {
+	return c.file != nil && c.file.config.WindowedDictionaryReading &&
+		c.maxRepetitionLevel == 0 && c.maxDefinitionLevel == 0 &&
+		c.Type().Kind() == ByteArray && isDictionaryEncoding(LookupEncoding(header.Encoding()))
+}
+
 func (c *Column) decodeDataPage(header DataPageHeader, numValues int, repetitionLevels, definitionLevels, page *buffer[byte], data []byte, dict Dictionary) (Page, error) {
 	pageEncoding := LookupEncoding(header.Encoding())
 	pageType := c.Type()
@@ -853,6 +870,13 @@ func (c *Column) decodeDataPage(header DataPageHeader, numValues int, repetition
 		// the dictionary page, but the page is still encoded using the RLE
 		// encoding in this case, so we convert it to RLE_DICTIONARY.
 		pageEncoding = &RLEDictionary
+		if c.useWindowedDictionary(header) {
+			newPage, err := newWindowedIndexedPage(newIndexedType(pageType, dict), c.Index(), numValues, data)
+			if err != nil {
+				return nil, err
+			}
+			return newBufferedDictionaryPage(newPage, page), nil
+		}
 		pageType = indexedPageType{newIndexedType(pageType, dict)}
 	}
 
