@@ -149,6 +149,66 @@ func TestWindowedDictionaryValidation(t *testing.T) {
 			}
 		})
 	}
+	// Invalid packed IDs at every max-reduction lane, the scalar tail and
+	// across validation windows are reported exactly.
+	for _, width := range []uint{16, 32} {
+		bad := int32(256)
+		if width == 32 {
+			bad = -1
+		}
+		for _, pos := range []int{0, 1, 2, 3, 5, dictionaryIndexWindowSize - 1, dictionaryIndexWindowSize, 2*dictionaryIndexWindowSize + 7} {
+			ids := make([]int32, 2*dictionaryIndexWindowSize+8)
+			for i := range ids {
+				ids[i] = int32(i % 256)
+			}
+			ids[pos] = bad
+			_, err := newWindowedIndexedPage(typ, 0, len(ids), appendWindowPacked([]byte{byte(width)}, ids, width))
+			if want := fmt.Sprintf("invalid dictionary index %d", bad); err == nil || err.Error() != want {
+				t.Fatalf("width%d/pos%d: %v", width, pos, err)
+			}
+		}
+	}
+}
+
+func TestWindowedDictionaryWindowSizing(t *testing.T) {
+	typ := windowTestDictionary()
+	ids := make([]int32, 3*dictionaryIndexWindowSize)
+	for i := range ids {
+		ids[i] = int32(i % 256)
+	}
+	packed := appendWindowPacked([]byte{8}, ids, 8)
+	rle := appendWindowRun([]byte{8}, len(ids), 7, 8)
+	for _, tt := range []struct {
+		name        string
+		data        []byte
+		batch, want int
+	}{
+		{"packed small batch", packed, 170, 176},
+		{"packed batch capped", packed, 5 * dictionaryIndexWindowSize, dictionaryIndexWindowSize},
+		{"rle never allocates", rle, 170, 0},
+		{"clean eof never allocates", []byte{8}, 170, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p, err := newWindowedIndexedPage(typ, 0, len(ids), tt.data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := p.Values().(*windowedIndexedPageValues)
+			values := make([]Value, tt.batch)
+			for {
+				_, err := r.ReadValues(values)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := len(*r.window); got != tt.want {
+				t.Fatalf("window %d, want %d", got, tt.want)
+			}
+		})
+	}
 }
 
 func windowTestFile(t testing.TB, width, rows, pageSize, version int) []byte {
@@ -378,8 +438,8 @@ func TestWindowedDictionaryOwnershipAndCompatibility(t *testing.T) {
 	if !reflect.DeepEqual(Row(held), clone) {
 		t.Fatal("overwritten window escaped into values")
 	}
-	if len(r.(*windowedIndexedPageValues).window) != dictionaryIndexWindowSize {
-		t.Fatal("window size")
+	if n := len(*r.(*windowedIndexedPageValues).window); n != dictionaryIndexWindowSize {
+		t.Fatalf("window size %d", n)
 	}
 	if p.(*windowedIndexedPage).materialized != nil {
 		t.Fatal("eager index allocation")
@@ -535,6 +595,41 @@ func BenchmarkWindowedDictionaryWideFile(b *testing.B) {
 					r.Close()
 				}
 			})
+		}
+	}
+}
+
+func TestWindowedDictionaryBoundsParity(t *testing.T) {
+	typ := windowTestDictionary()
+	// Short RLE runs, bit-packed spans and a clean-EOF tail spanning several
+	// scratch flushes, with extremes placed late in the page.
+	for _, run := range []int{1, 3, 8, 64} {
+		ids := make([]int32, 5*dictionaryIndexWindowSize+11)
+		for i := range ids {
+			ids[i] = int32(17 + (i/run*31)%200)
+		}
+		ids[len(ids)-20], ids[len(ids)-40] = 255, 2
+		data, err := RLEDictionary.EncodeInt32(nil, ids)
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := len(ids) + 9 // Zero-extended tail contributes ID 0.
+		decoded, err := RLEDictionary.DecodeInt32(nil, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded = append(decoded[:len(ids)], make([]int32, 9)...)
+		eager := newIndexedPage(typ, makeColumnIndex(0), int32(count), encoding.Int32Values(decoded))
+		lazy, err := newWindowedIndexedPage(typ, 0, count, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, span := range [][2]int64{{0, int64(count)}, {0, int64(len(ids))}, {5, 6}, {int64(len(ids) - 45), int64(len(ids) - 1)}} {
+			wl, wh, wok := eager.Slice(span[0], span[1]).Bounds()
+			gl, gh, gok := lazy.Slice(span[0], span[1]).Bounds()
+			if wok != gok || !reflect.DeepEqual(wl, gl) || !reflect.DeepEqual(wh, gh) {
+				t.Fatalf("run%d %v: eager %v..%v, windowed %v..%v", run, span, wl, wh, gl, gh)
+			}
 		}
 	}
 }

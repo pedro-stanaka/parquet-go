@@ -20,18 +20,30 @@ Optional, repeated, numeric, fixed-length and non-dictionary pages keep their
 existing eager decoding behavior.
 
 The lazy page retains the encoded page buffer and dictionary. Its cursor pauses
-inside RLE runs and bit-packed groups. Index storage is at most 4096 int32 slots
-(16 KiB) per value reader. A column reader, including the column readers behind
-ReadRows, owns and reuses one such window across pages and seeks, releasing it
-on Close. Independent Page.Values readers use independent windows. Dictionary
-lookup produces values that reference dictionary contents, never mutable index
-windows. Existing page reference counting and row byte-value lifetime rules
+inside RLE runs and bit-packed groups. Repeated (RLE) runs, and the
+zero-extended tail after a clean EOF, are never expanded: the dictionary value
+is looked up once and copied across the output, so they use no index storage.
+Bit-packed IDs are decoded into a window of at most 1024 int32 slots (4 KiB)
+per value reader, sized to the caller's read batch (rounded up to eight) and
+allocated only when a bit-packed run is first read. The row readers behind
+ReadRows read 170 values per column, so their windows are 176 slots. A column
+reader owns and reuses one window across pages and seeks, releasing it on
+Close. Independent Page.Values readers use independent windows. Byte-array
+values are written directly from dictionary offsets and reference dictionary
+contents, never mutable index windows; they are identical to the eager path's
+values. Existing page reference counting and row byte-value lifetime rules
 remain in effect.
+
+This is the same bounded intermediate-ID technique used by Arrow Rust
+(`DictIndexDecoder`, 1024 IDs), Arrow C++ (`GetBatchWithDict`, 1024 IDs, with
+direct repeated-run fills) and Polars. It does not stream the dictionary
+itself.
 
 Before returning a page, the encoded stream is structurally validated and
 logical IDs are checked against the dictionary. RLE runs are validated without
-expansion; bit-packed IDs are checked in fixed windows unless the dictionary
-covers every ID representable at that width. Every run is still structurally
+expansion; bit-packed IDs are checked in fixed windows with an unsigned
+max-reduction unless the dictionary covers every ID representable at that
+width. Every run is still structurally
 checked, including runs after the logical count. Surplus RLE values and packed
 IDs are ignored, matching the eager decode-then-truncate policy; this is not
 strict final-group padding validation. A clean EOF zero-extends short streams
@@ -45,7 +57,8 @@ return errors rather than being passed to dictionary lookup.
 - Slice retains a lazy view; seeking does not require full decoding. Starting
   a slice replays preceding run headers, so repeated increasing-offset slices
   can become quadratic in run count; there are no cursor checkpoints yet.
-- Bounds scans with bounded scratch space rather than materializing indexes.
+- Bounds scans with bounded scratch space rather than materializing indexes;
+  each RLE run contributes one entry.
 - **Page.Data is an explicit exception:** it materializes the complete int32
   index array once per page/view, preserving the existing immutable Data and
   Type.Encode contract. It is safe for concurrent calls under normal page
@@ -61,8 +74,8 @@ return errors rather than being passed to dictionary lookup.
   lifetime safeguards are unchanged.
 - Packed decoding uses bounded bitpack.Unpack blocks, with stack scratch for
   partial groups and unpadded tails. There are no allocations per refill.
-  Validation and cursor/window overhead still add CPU work. Small-page
-  workloads can allocate more than the default pooled eager decoder.
+  Validation still unpacks bit-packed IDs a second time when the dictionary
+  does not cover the bit width.
 
 ## Synthetic qualification
 
@@ -73,7 +86,7 @@ gofmt -w column.go column_chunk.go config.go dictionary_window*.go
 go test ./...
 go test -race ./...
 go test -run '^$' -bench '^BenchmarkWindowedDictionary(Read|WideFile)$' \
-  -benchmem -benchtime=10x -count=3
+  -benchmem -benchtime=20x -count=8
 ```
 
 Full tests and race tests pass. Tests cover run/window/page boundaries, varied
@@ -86,25 +99,28 @@ row contents across row groups and close, clone/encode compatibility and
 default/fallback paths. End-to-end full-scan parity uses synthetic wide schemas, multiple row
 groups, compressed V1/V2 pages and small/large page targets.
 
-Representative medians from three ten-iteration benchmark runs after the
-ownership and block-unpacking fixes (each metric independently medianed):
+Window capacity was swept at 512, 1024, 2048 and 4096 slots with 170, 4096 and
+16,384-value batches over bit-packed and short-run pages. Time differences were
+within about 2% (noise), so the smallest Arrow-equivalent cap of 1024 was
+chosen; it only changes allocation for batches above 1024 values.
 
-| Workload | Eager bytes/op | Windowed bytes/op | Eager time | Windowed time | Eager/windowed allocs/op |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 4096 IDs, RLE | 16,755 | 16,915 | 20.921 us | 26.800 us | 3 / 3 |
-| 4096 IDs, bit-packed | 16,755 | 16,915 | 17.700 us | 20.521 us | 3 / 3 |
-| 1,048,576 IDs, RLE | 4,194,688 | 16,915 | 1.899 ms | 2.429 ms | 3 / 3 |
-| 1,048,576 IDs, bit-packed | 4,194,675 | 16,915 | 1.822 ms | 2.361 ms | 3 / 3 |
-| Wide file, 4 KiB page target | 13,150,943 | 5,316,732 | 21.005 ms | 23.249 ms | 33,774 / 27,257 |
-| Wide file, 4 MiB page target | 15,041,799 | 3,481,696 | 17.604 ms | 19.720 ms | 5,397 / 5,059 |
+Eager versus windowed, same run, eight twenty-iteration samples each (benchstat
+medians, p=0.000–0.001):
 
-Packed microbenchmark time is now 1.16x eager for 4096 IDs and 1.30x for
-1,048,576 IDs, rather than the earlier scalar implementation's roughly 3x.
-These are separate short runs, not a controlled old/new CPU comparison.
-Wide-file allocation volume falls 59.6% (small page target) and 76.9% (large),
-while elapsed time rises 10.7% and 12.0% against the paired eager runs.
-Small-page allocation counts fall 19.3% after returning encoded buffers normally.
-No universal CPU improvement over eager decoding is claimed.
+| Workload | Eager time | Windowed time | Eager B/op | Windowed B/op |
+| --- | ---: | ---: | ---: | ---: |
+| 4096 IDs, one RLE run | 7.77 us | 2.50 us (−68%) | 16,601 | 393 |
+| 4096 IDs, bit-packed | 7.82 us | 6.55 us (−16%) | 16,601 | 905 |
+| 1,048,576 IDs, one RLE run | 1.83 ms | 0.44 ms (−76%) | 4,194,522 | 393 |
+| 1,048,576 IDs, bit-packed | 1.85 ms | 1.46 ms (−21%) | 4,194,524 | 905 |
+| Wide file, 4 KiB page target | 21.77 ms | 19.54 ms (−10%) | 12.54 MiB | 4.14 MiB |
+| Wide file, 4 MiB page target | 17.87 ms | 16.45 ms (−8%) | 14.35 MiB | 2.27 MiB |
+
+Wide-file allocation counts fall 19.3% (small pages) and 6.5% (large). A local
+sweep over 1/8/64/4096-value run lengths, 200- and 256-entry dictionaries and
+170/4096-value batches found the windowed path faster than eager in every
+case except fully bit-packed pages with a non-power-of-two dictionary, which
+are within a few percent of eager (validation's second unpack).
 
 The wide-file benchmark includes 64 dictionary string columns, fallback
 columns and 32,769 rows. The microbenchmark includes page construction,

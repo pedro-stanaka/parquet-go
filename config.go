@@ -545,7 +545,8 @@ func OptimisticRead(enabled bool) FileOption {
 // decoding. ReadValues and ReadRows do not materialize the full index array;
 // Page.Data explicitly materializes it for compatibility with page encoders.
 // Compressed/encoded pages, dictionaries and returned values are not bounded by
-// this option. Each active value reader uses at most 4096 int32 index slots.
+// this option. Each active value reader uses at most 1024 int32 index slots,
+// sized to its read batch and allocated only when bit-packed IDs are read.
 func WindowedDictionaryReading(enabled bool) FileOption {
 	return fileOption(func(config *FileConfig) { config.WindowedDictionaryReading = enabled })
 }

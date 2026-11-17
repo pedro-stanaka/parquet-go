@@ -6,12 +6,13 @@ import (
 	"io"
 	"math"
 	"sync"
+	"unsafe"
 
 	"github.com/parquet-go/bitpack"
 	"github.com/parquet-go/parquet-go/encoding"
 )
 
-const dictionaryIndexWindowSize = 4096
+const dictionaryIndexWindowSize = 1024
 
 // dictionaryIndexCursor pauses inside both RLE runs and bit-packed groups.
 // It never expands a run or allocates storage proportional to its length.
@@ -38,12 +39,15 @@ func newDictionaryIndexCursor(data []byte) (dictionaryIndexCursor, error) {
 
 func (c *dictionaryIndexCursor) nextRun() error {
 	for len(c.data) > 0 {
-		u, n := binary.Uvarint(c.data)
-		if n == 0 {
-			return io.ErrUnexpectedEOF
-		}
-		if n < 0 {
-			return fmt.Errorf("dictionary index run header overflow")
+		u, n := uint64(c.data[0]), 1
+		if u >= 0x80 {
+			u, n = binary.Uvarint(c.data)
+			if n == 0 {
+				return io.ErrUnexpectedEOF
+			}
+			if n < 0 {
+				return fmt.Errorf("dictionary index run header overflow")
+			}
 		}
 		c.data = c.data[n:]
 		count := u >> 1
@@ -68,9 +72,16 @@ func (c *dictionaryIndexCursor) nextRun() error {
 			if size > len(c.data) {
 				return io.ErrUnexpectedEOF
 			}
-			var b [4]byte
-			copy(b[:], c.data[:size])
-			c.word = int32(binary.LittleEndian.Uint32(b[:]))
+			switch size {
+			case 0:
+				c.word = 0
+			case 1:
+				c.word = int32(c.data[0])
+			default:
+				var b [4]byte
+				copy(b[:], c.data[:size])
+				c.word = int32(binary.LittleEndian.Uint32(b[:]))
+			}
 			c.data = c.data[size:]
 			c.remaining = int64(count)
 		}
@@ -130,6 +141,35 @@ func (c *dictionaryIndexCursor) read(dst []int32) (int, error) {
 	return n, nil
 }
 
+// load parses the next run when the current one is exhausted. eof reports a
+// clean end of stream, which callers zero-extend like eager indexed pages.
+func (c *dictionaryIndexCursor) load() (eof bool, err error) {
+	if c.remaining != 0 {
+		return false, nil
+	}
+	if err := c.nextRun(); err != nil {
+		return err == io.EOF, err
+	}
+	return false, nil
+}
+
+func (c *dictionaryIndexCursor) repeated() bool { return c.packed == nil || c.width == 0 }
+
+// take consumes at most limit IDs from the loaded run without expanding
+// repeats: an RLE run returns ids == nil and the repeated id. Bit-packed IDs
+// are decoded into window, which also bounds n.
+func (c *dictionaryIndexCursor) take(window []int32, limit int) (ids []int32, id int32, n int) {
+	if c.repeated() {
+		n = int(min(int64(limit), c.remaining))
+		c.consume(int64(n))
+		return nil, c.word, n
+	}
+	n = int(min(int64(min(limit, len(window))), c.remaining))
+	c.readPacked(window[:n])
+	c.consume(int64(n))
+	return window[:n], 0, n
+}
+
 // readPacked unpacks whole aligned groups directly. Only partial groups and
 // the unpadded tail need fixed scratch, independent of the encoded run length.
 func (c *dictionaryIndexCursor) readPacked(dst []int32) {
@@ -165,20 +205,21 @@ func validateDictionaryIndexes(data []byte, count int64, dict Dictionary) error 
 		return err
 	}
 	var window [dictionaryIndexWindowSize]int32
+	dictLen := uint64(dict.Len())
 	left := count
 	for {
 		if err := c.nextRun(); err != nil {
 			if err != io.EOF {
 				return err
 			}
-			if left > 0 && dict.Len() == 0 {
+			if left > 0 && dictLen == 0 {
 				return fmt.Errorf("invalid synthesized dictionary index 0")
 			}
 			return nil
 		}
 		n := min(left, c.remaining)
 		if c.packed == nil || c.width == 0 {
-			if n > 0 && (c.word < 0 || int64(c.word) >= int64(dict.Len())) {
+			if n > 0 && uint64(uint32(c.word)) >= dictLen {
 				return fmt.Errorf("invalid dictionary index %d", c.word)
 			}
 			left -= n
@@ -186,19 +227,22 @@ func validateDictionaryIndexes(data []byte, count int64, dict Dictionary) error 
 		} else {
 			// Width < 32 excludes negative int32 IDs. Still parse every run,
 			// including surplus values, to preserve structural validation.
-			if c.width < 32 && uint64(dict.Len()) >= uint64(1)<<c.width {
+			if c.width < 32 && dictLen >= uint64(1)<<c.width {
 				left -= n
 				c.consume(c.remaining)
 				continue
 			}
 			for n > 0 {
 				m := min(n, int64(len(window)))
-				if _, err := c.read(window[:int(m)]); err != nil {
+				ids := window[:int(m)]
+				if _, err := c.read(ids); err != nil {
 					return err
 				}
-				for _, id := range window[:int(m)] {
-					if id < 0 || int64(id) >= int64(dict.Len()) {
-						return fmt.Errorf("invalid dictionary index %d", id)
+				if uint64(maxDictionaryIndex(ids)) >= dictLen {
+					for _, id := range ids {
+						if uint64(uint32(id)) >= dictLen {
+							return fmt.Errorf("invalid dictionary index %d", id)
+						}
 					}
 				}
 				n -= m
@@ -278,21 +322,44 @@ func (p *windowedIndexedPage) Slice(i, j int64) Page {
 	}
 	return &windowedIndexedPage{typ: p.typ, data: p.data, start: p.start + i, count: j - i, columnIndex: p.columnIndex}
 }
+
+// Bounds accumulates IDs into bounded scratch. One entry per RLE run (and for
+// a zero-extended tail) suffices for min/max, so runs never expand.
 func (p *windowedIndexedPage) Bounds() (minValue, maxValue Value, ok bool) {
 	c := p.cursor()
 	var window [dictionaryIndexWindowSize]int32
-	for left := p.count; left > 0; {
-		n := min(left, int64(len(window)))
-		c.read(window[:int(n)])
-		lo, hi := p.typ.dict.Bounds(window[:int(n)])
+	fill := 0
+	flush := func() {
+		lo, hi := p.typ.dict.Bounds(window[:fill])
 		if !ok || p.typ.Compare(lo, minValue) < 0 {
 			minValue = lo
 		}
 		if !ok || p.typ.Compare(hi, maxValue) > 0 {
 			maxValue = hi
 		}
-		ok = true
-		left -= n
+		ok, fill = true, 0
+	}
+	for left := p.count; left > 0; {
+		if fill == len(window) {
+			flush()
+		}
+		limit := int(min(left, math.MaxInt32))
+		if eof, _ := c.load(); eof { // The constructor validated the stream.
+			window[fill] = 0
+			fill++
+			break
+		}
+		ids, id, n := c.take(window[fill:], limit)
+		if ids == nil {
+			window[fill] = id
+			fill++
+		} else {
+			fill += len(ids)
+		}
+		left -= int64(n)
+	}
+	if fill > 0 {
+		flush()
 	}
 	if ok {
 		minValue.columnIndex = p.columnIndex
@@ -301,38 +368,66 @@ func (p *windowedIndexedPage) Bounds() (minValue, maxValue Value, ok bool) {
 	return
 }
 func (p *windowedIndexedPage) Values() ValueReader {
-	return &windowedIndexedPageValues{page: p, cursor: p.cursor(), left: p.count}
+	r := &windowedIndexedPageValues{page: p, cursor: p.cursor(), left: p.count}
+	r.window = &r.own
+	if d, ok := p.typ.dict.(*byteArrayDictionary); ok && d.columnIndex == p.columnIndex {
+		r.bytes = d
+	}
+	return r
 }
 
 type windowedIndexedPageValues struct {
 	page   *windowedIndexedPage
 	cursor dictionaryIndexCursor
 	left   int64
-	window []int32
+	// window points at storage owned by the column reader, or at own for
+	// standalone Page.Values readers. It grows to the largest packed request,
+	// capped at dictionaryIndexWindowSize, so small-batch readers stay small.
+	window *[]int32
+	own    []int32
+	one    [1]int32
+	bytes  *byteArrayDictionary
+}
+
+// indexWindow sizes storage by the caller's batch, not the remainder of a
+// partially filled batch, so steady-state readers allocate once.
+func (r *windowedIndexedPageValues) indexWindow(batch int) []int32 {
+	need := min(batch, dictionaryIndexWindowSize)
+	if w := *r.window; len(w) >= need {
+		return w
+	}
+	w := make([]int32, min((need+7)&^7, dictionaryIndexWindowSize))
+	*r.window = w
+	return w
 }
 
 func (r *windowedIndexedPageValues) ReadValues(values []Value) (n int, err error) {
 	if r.left == 0 {
 		return 0, io.EOF
 	}
-	if len(values) == 0 {
-		return 0, nil
-	}
-	if r.window == nil {
-		r.window = make([]int32, min(r.left, dictionaryIndexWindowSize))
-	}
 	for n < len(values) && r.left > 0 {
-		m := min(len(values)-n, len(r.window), int(r.left))
-		read, readErr := r.cursor.read(r.window[:m])
-		if read != m || readErr != nil {
-			if readErr == nil || readErr == io.EOF {
-				readErr = io.ErrUnexpectedEOF
-			}
-			return n, readErr
+		limit := int(min(int64(len(values)-n), r.left))
+		eof, loadErr := r.cursor.load()
+		if loadErr != nil && !eof {
+			return n, loadErr
 		}
-		r.page.typ.dict.Lookup(r.window[:m], values[n:n+m])
-		for i := range values[n : n+m] {
-			values[n+i].columnIndex = r.page.columnIndex
+		var ids []int32
+		var id int32
+		m := limit
+		switch {
+		case eof:
+		case r.cursor.repeated():
+			ids, id, m = r.cursor.take(nil, limit)
+		default:
+			ids, id, m = r.cursor.take(r.indexWindow(len(values)), limit)
+		}
+		out := values[n : n+m]
+		if ids == nil {
+			r.one[0] = id
+			r.lookup(r.one[:], out[:1])
+			fillValues(out[1:], out[0])
+		} else {
+			r.lookup(ids, out)
 		}
 		n += m
 		r.left -= int64(m)
@@ -341,4 +436,55 @@ func (r *windowedIndexedPageValues) ReadValues(values []Value) (n int, err error
 		err = io.EOF
 	}
 	return
+}
+
+// lookup writes each Value once for the file-reader dictionary type, rather
+// than memset-then-overwrite plus per-ID buffer slicing in the generic path.
+// IDs were validated when the page was constructed.
+func (r *windowedIndexedPageValues) lookup(ids []int32, out []Value) {
+	d := r.bytes
+	if d == nil {
+		r.page.typ.dict.Lookup(ids, out)
+		for i := range out {
+			out[i].columnIndex = r.page.columnIndex
+		}
+		return
+	}
+	offsets := d.offsets.Slice()
+	data := d.values.Slice()
+	out = out[:len(ids)]
+	for i, id := range ids {
+		j, k := offsets[id], offsets[id+1]
+		b := data[j:k:k]
+		out[i] = Value{kind: ^int8(ByteArray), ptr: unsafe.SliceData(b), u64: uint64(len(b)), columnIndex: d.columnIndex}
+	}
+}
+
+// fillValues uses plain stores for short runs, where memsetValues' doubling
+// copies cost more than they save.
+func fillValues(out []Value, v Value) {
+	if len(out) > 32 {
+		memsetValues(out, v)
+		return
+	}
+	for i := range out {
+		out[i] = v
+	}
+}
+
+// maxDictionaryIndex is an unsigned max-reduction: negative IDs wrap above any
+// dictionary length. Four accumulators break the serial dependency chain.
+func maxDictionaryIndex(ids []int32) uint32 {
+	var h0, h1, h2, h3 uint32
+	for len(ids) >= 4 {
+		h0 = max(h0, uint32(ids[0]))
+		h1 = max(h1, uint32(ids[1]))
+		h2 = max(h2, uint32(ids[2]))
+		h3 = max(h3, uint32(ids[3]))
+		ids = ids[4:]
+	}
+	for _, id := range ids {
+		h0 = max(h0, uint32(id))
+	}
+	return max(h0, h1, h2, h3)
 }

@@ -138,10 +138,7 @@ func (r *columnChunkValueReader) ReadValues(values []Value) (int, error) {
 			if v, ok := r.values.(*windowedIndexedPageValues); ok {
 				// The column reader owns this window across page transitions.
 				// Returned values reference the dictionary, never these IDs.
-				if r.indexWindow == nil {
-					r.indexWindow = make([]int32, dictionaryIndexWindowSize)
-				}
-				v.window = r.indexWindow
+				v.window = &r.indexWindow
 			}
 		}
 
