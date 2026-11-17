@@ -340,8 +340,12 @@ func TestWindowedDictionaryFileParity(t *testing.T) {
 				a.SeekToRow(0)
 				b.SeekToRow(0)
 				ar, br := make([]Row, 1), make([]Row, 1)
-				a.ReadRows(ar)
-				b.ReadRows(br)
+				if an, aerr := a.ReadRows(ar); an != 1 || (aerr != nil && aerr != io.EOF) {
+					t.Fatalf("eager read: %d %v", an, aerr)
+				}
+				if bn, berr := b.ReadRows(br); bn != 1 || (berr != nil && berr != io.EOF) {
+					t.Fatalf("windowed read: %d %v", bn, berr)
+				}
 				want := ar[0].Clone()
 				held := append(Row(nil), br[0]...)
 				b.Close()

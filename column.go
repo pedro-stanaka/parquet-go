@@ -727,6 +727,8 @@ func (c *Column) decompress(compressedPageData []byte, uncompressedPageSize int3
 // DecodeDataPageV1 decodes a data page from the header, compressed data, and
 // optional dictionary passed as arguments.
 func (c *Column) DecodeDataPageV1(header DataPageHeaderV1, page []byte, dict Dictionary) (Page, error) {
+	// Lazy dictionary pages retain their encoded buffer, so detach it from
+	// caller memory, which may be reused after this call returns.
 	if c.useWindowedDictionary(header) {
 		page = append([]byte(nil), page...)
 	}
@@ -783,6 +785,7 @@ func (c *Column) decodeDataPageV1(header DataPageHeaderV1, page *buffer[byte], d
 // DecodeDataPageV2 decodes a data page from the header, compressed data, and
 // optional dictionary passed as arguments.
 func (c *Column) DecodeDataPageV2(header DataPageHeaderV2, page []byte, dict Dictionary) (Page, error) {
+	// See DecodeDataPageV1.
 	if c.useWindowedDictionary(header) {
 		page = append([]byte(nil), page...)
 	}
@@ -852,7 +855,8 @@ func (c *Column) decodeDataPageV2(header DataPageHeaderV2, page *buffer[byte], d
 	return c.decodeDataPage(header, numValues, repetitionLevels, definitionLevels, page, pageData, dict)
 }
 
-// Exported decoders copy eligible encoded input; FilePages supplies owned buffers.
+// useWindowedDictionary reports whether a page qualifies for lazy dictionary-index
+// decoding: opted in, flat, required BYTE_ARRAY and dictionary-encoded.
 func (c *Column) useWindowedDictionary(header DataPageHeader) bool {
 	return c.file != nil && c.file.config.WindowedDictionaryReading &&
 		c.maxRepetitionLevel == 0 && c.maxDefinitionLevel == 0 &&

@@ -113,6 +113,37 @@ func TestWindowedDictionaryExportedSourceOwnership(t *testing.T) {
 	}
 }
 
+func TestWindowedDictionaryUnvalidatedStreamPanics(t *testing.T) {
+	// Pages are only built after validation; bypass it to prove a broken
+	// invariant fails loudly instead of zero-filling or looping.
+	typ := windowTestDictionary()
+	for name, data := range map[string][]byte{
+		"width":     {33},
+		"truncated": appendWindowRun([]byte{16}, 2, 1, 16)[:3],
+	} {
+		for _, op := range []string{"Data", "Bounds"} {
+			t.Run(name+"/"+op, func(t *testing.T) {
+				p := &windowedIndexedPage{typ: typ, data: data, count: 4}
+				defer func() {
+					if recover() == nil {
+						t.Fatal("expected panic")
+					}
+				}()
+				if op == "Data" {
+					p.Data()
+				} else {
+					p.Bounds()
+				}
+			})
+		}
+	}
+	// ReadValues surfaces stream errors instead of panicking.
+	p := &windowedIndexedPage{typ: typ, data: appendWindowRun([]byte{16}, 2, 1, 16)[:3], count: 4}
+	if _, err := p.Values().ReadValues(make([]Value, 4)); err == nil || err == io.EOF {
+		t.Fatalf("ReadValues error = %v", err)
+	}
+}
+
 func TestWindowedDictionaryEncodedBufferDetach(t *testing.T) {
 	typ := windowTestDictionary()
 	data := appendWindowRun([]byte{8}, 10, 1, 8)

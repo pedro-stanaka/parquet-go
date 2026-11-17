@@ -302,16 +302,27 @@ func (p *windowedIndexedPage) NumNulls() int64          { return 0 }
 func (p *windowedIndexedPage) Size() int64              { return 4 * p.count }
 func (p *windowedIndexedPage) RepetitionLevels() []byte { return nil }
 func (p *windowedIndexedPage) DefinitionLevels() []byte { return nil }
+
+// cursor and Data rely on newWindowedIndexedPage having validated the complete
+// stream; an error here means that invariant was broken, so fail loudly rather
+// than return zero-filled indexes.
 func (p *windowedIndexedPage) cursor() dictionaryIndexCursor {
-	c, _ := newDictionaryIndexCursor(p.data)
-	c.skip(p.start) // The complete stream was validated by the constructor.
+	c, err := newDictionaryIndexCursor(p.data)
+	if err == nil {
+		err = c.skip(p.start)
+	}
+	if err != nil {
+		panic("parquet: windowed dictionary page violates constructor validation: " + err.Error())
+	}
 	return c
 }
 func (p *windowedIndexedPage) Data() encoding.Values {
 	p.once.Do(func() {
 		p.materialized = make([]int32, int(p.count))
 		c := p.cursor()
-		c.read(p.materialized)
+		if _, err := c.read(p.materialized); err != nil {
+			panic("parquet: windowed dictionary page violates constructor validation: " + err.Error())
+		}
 	})
 	return encoding.Int32Values(p.materialized)
 }
@@ -343,10 +354,12 @@ func (p *windowedIndexedPage) Bounds() (minValue, maxValue Value, ok bool) {
 			flush()
 		}
 		limit := int(min(left, math.MaxInt32))
-		if eof, _ := c.load(); eof { // The constructor validated the stream.
+		if eof, err := c.load(); eof {
 			window[fill] = 0
 			fill++
 			break
+		} else if err != nil {
+			panic("parquet: windowed dictionary page violates constructor validation: " + err.Error())
 		}
 		ids, id, n := c.take(window[fill:], limit)
 		if ids == nil {
