@@ -57,8 +57,8 @@ func (c *dictionaryIndexCursor) nextRun() error {
 		if count == 0 {
 			continue
 		}
-		c.packed = nil
-		c.bit = 0
+		// Width-0 packed runs are repeats of c.word, so every run resets it.
+		c.packed, c.bit, c.word = nil, 0, 0
 		if u&1 != 0 {
 			size := count * uint64(c.width)
 			if size > uint64(len(c.data)) {
@@ -74,7 +74,6 @@ func (c *dictionaryIndexCursor) nextRun() error {
 			}
 			switch size {
 			case 0:
-				c.word = 0
 			case 1:
 				c.word = int32(c.data[0])
 			default:

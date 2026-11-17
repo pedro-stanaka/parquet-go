@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -356,6 +358,71 @@ func TestWindowedDictionaryFileParity(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Files from other writers (Impala, parquet-mr, legacy PLAIN_DICTIONARY) cover
+// run layouts and padding this library's writer may never produce.
+func TestWindowedDictionaryTestdataParity(t *testing.T) {
+	paths, err := filepath.Glob("testdata/*.parquet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lazyPages := 0
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			base, baseErr := OpenFile(bytes.NewReader(data), int64(len(data)))
+			file, fileErr := OpenFile(bytes.NewReader(data), int64(len(data)), WindowedDictionaryReading(true))
+			if (baseErr == nil) != (fileErr == nil) {
+				t.Fatalf("open: eager=%v windowed=%v", baseErr, fileErr)
+			}
+			if baseErr != nil {
+				t.Skip(baseErr)
+			}
+			for g, rg := range file.RowGroups() {
+				for _, chunk := range rg.ColumnChunks() {
+					pages := chunk.Pages()
+					for {
+						p, err := pages.ReadPage()
+						if err != nil {
+							break
+						}
+						if _, ok := p.(*bufferedDictionaryPage); ok {
+							lazyPages++
+						}
+						Release(p)
+					}
+					pages.Close()
+				}
+				a, b := base.RowGroups()[g].Rows(), rg.Rows()
+				ar, br := make([]Row, 64), make([]Row, 64)
+				for total := 0; ; {
+					an, ae := a.ReadRows(ar)
+					bn, be := b.ReadRows(br)
+					if an != bn || (ae == nil) != (be == nil) || (ae == io.EOF) != (be == io.EOF) {
+						t.Fatalf("row group %d at row %d: eager=%d,%v windowed=%d,%v", g, total, an, ae, bn, be)
+					}
+					for i := range an {
+						if !ar[i].Equal(br[i]) {
+							t.Fatalf("row group %d row %d differs", g, total+i)
+						}
+					}
+					total += an
+					if ae != nil {
+						break
+					}
+				}
+				a.Close()
+				b.Close()
+			}
+		})
+	}
+	if lazyPages == 0 {
+		t.Fatal("no testdata page used windowed dictionary reading")
 	}
 }
 
